@@ -7,7 +7,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <errno.h>
-
+#include <time.h>
 
 typedef enum {
     OP_NONE,
@@ -295,6 +295,8 @@ static int do_cat(
     int failures = 0;
 
     int file_count = operand_count > 0 ? operand_count : 1;
+    int at_line_start = 1;
+    int line_has_content = 0;
 
     for (int file_index = 0; file_index < file_count; file_index++) {
         int fd;
@@ -311,8 +313,6 @@ static int do_cat(
             }
         }
 
-        int at_line_start = 1;
-        int line_has_content = 0;
         int skip_blank_line = 0;
 
         while (1) {
@@ -413,12 +413,151 @@ static int do_copy(
     char **operands,
     int operand_count)
 {
-    (void)options;
-    (void)operands;
     (void)operand_count;
 
-    fprintf(stderr, "myfs: copy is not implemented yet\n");
-    return 1;
+    const char *source = operands[0];
+    const char *destination = operands[1];
+
+    struct stat source_info;
+    struct stat destination_info;
+
+    if (stat(source, &source_info) == -1) {
+        perror(source);
+        return 1;
+    }
+
+    if (!S_ISREG(source_info.st_mode)) {
+        fprintf(stderr, "myfs: source is not a regular file: %s\n",
+                source);
+        return 1;
+    }
+
+    if (stat(destination, &destination_info) == 0) {
+        if (source_info.st_dev == destination_info.st_dev &&
+            source_info.st_ino == destination_info.st_ino) {
+            fprintf(stderr,
+                    "myfs: source and destination are the same file\n");
+            return 1;
+        }
+
+        if (options->no_clobber) {
+            fprintf(stderr,
+                    "myfs: destination already exists: %s\n",
+                    destination);
+            return 1;
+        }
+
+        if (options->interactive) {
+            char answer[32];
+
+            printf("Overwrite '%s'? (y/n): ", destination);
+            fflush(stdout);
+
+            if (fgets(answer, sizeof(answer), stdin) == NULL ||
+                (answer[0] != 'y' && answer[0] != 'Y')) {
+                printf("myfs: copy cancelled\n");
+                return 0;
+            }
+        }
+    } else if (errno != ENOENT) {
+        perror(destination);
+        return 1;
+    }
+
+    int source_fd = open(source, O_RDONLY);
+
+    if (source_fd == -1) {
+        perror(source);
+        return 1;
+    }
+
+    int destination_flags = O_WRONLY | O_CREAT;
+
+    if (options->no_clobber) {
+        destination_flags |= O_EXCL;
+    } else {
+        destination_flags |= O_TRUNC;
+    }
+
+    mode_t destination_mode = options->preserve
+        ? source_info.st_mode & 07777
+        : 0666;
+
+    int destination_fd = open(
+        destination,
+        destination_flags,
+        destination_mode
+    );
+
+    if (destination_fd == -1) {
+        perror(destination);
+        close(source_fd);
+        return 1;
+    }
+
+    int failed = 0;
+    char buffer[4096];
+
+    while (1) {
+        ssize_t bytes_read = read(source_fd, buffer, sizeof(buffer));
+
+        if (bytes_read == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            perror("read");
+            failed = 1;
+            break;
+        }
+
+        if (bytes_read == 0) {
+            break;
+        }
+
+        if (write_all(destination_fd, buffer, (size_t)bytes_read) == -1) {
+            perror("write");
+            failed = 1;
+            break;
+        }
+    }
+
+    if (!failed && options->preserve) {
+        if (fchmod(destination_fd, source_info.st_mode & 07777) == -1) {
+            perror("fchmod");
+            failed = 1;
+        }
+
+        struct timespec times[2];
+
+        times[0] = source_info.st_atim;
+        times[1] = source_info.st_mtim;
+
+        if (!failed && futimens(destination_fd, times) == -1) {
+            perror("futimens");
+            failed = 1;
+        }
+    }
+
+    if (close(source_fd) == -1) {
+        perror(source);
+        failed = 1;
+    }
+
+    if (close(destination_fd) == -1) {
+        perror(destination);
+        failed = 1;
+    }
+
+    if (failed) {
+        return 1;
+    }
+
+    if (options->verbose) {
+        printf("%s -> %s\n", source, destination);
+    }
+
+    return 0;
 }
 
 
@@ -427,12 +566,87 @@ static int do_move(
     char **operands,
     int operand_count)
 {
-    (void)options;
-    (void)operands;
     (void)operand_count;
 
-    fprintf(stderr, "myfs: move is not implemented yet\n");
-    return 1;
+    const char *source = operands[0];
+    const char *destination = operands[1];
+
+    struct stat source_info;
+    struct stat destination_info;
+
+    if (stat(source, &source_info) == -1) {
+        perror(source);
+        return 1;
+    }
+
+    int destination_exists = (lstat(destination, &destination_info) == 0);
+
+    if (!destination_exists && errno != ENOENT) {
+        perror(destination);
+        return 1;
+    }
+
+    if (destination_exists) {
+        if (options->no_clobber) {
+            fprintf(stderr,
+                    "myfs: destination already exists: %s\n",
+                    destination);
+            return 1;
+        }
+
+        if (options->interactive) {
+            char answer[32];
+
+            printf("Overwrite '%s'? (y/n): ", destination);
+            fflush(stdout);
+
+            if (fgets(answer, sizeof(answer), stdin) == NULL ||
+                (answer[0] != 'y' && answer[0] != 'Y')) {
+                printf("myfs: move cancelled\n");
+                return 0;
+            }
+        }
+    }
+
+    if (rename(source, destination) == 0) {
+        if (options->verbose) {
+            printf("%s -> %s\n", source, destination);
+        }
+
+        return 0;
+    }
+
+    if (errno != EXDEV) {
+        perror("rename");
+        return 1;
+    }
+
+    Options copy_options = *options;
+    copy_options.operation = OP_COPY;
+    copy_options.verbose = 0;
+    copy_options.interactive = 0;
+    copy_options.no_clobber = 0;
+    copy_options.preserve = 1;
+
+    char *copy_operands[] = {
+        (char *)source,
+        (char *)destination
+    };
+
+    if (do_copy(&copy_options, copy_operands, 2) != 0) {
+        return 1;
+    }
+
+    if (unlink(source) == -1) {
+        perror(source);
+        return 1;
+    }
+
+    if (options->verbose) {
+        printf("%s -> %s\n", source, destination);
+    }
+
+    return 0;
 }
 
 
