@@ -235,17 +235,176 @@ static int do_touch(
 }
 
 
+static int write_all(int fd, const void *buffer, size_t count)
+{
+    const char *data = buffer;
+    size_t written = 0;
+
+    while (written < count) {
+        ssize_t result = write(fd, data + written, count - written);
+
+        if (result == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            return -1;
+        }
+
+        if (result == 0) {
+            errno = EIO;
+            return -1;
+        }
+
+        written += (size_t)result;
+    }
+
+    return 0;
+}
+
+
+static int print_line_number(long number)
+{
+    char buffer[64];
+
+    int length = snprintf(
+        buffer,
+        sizeof(buffer),
+        "%6ld\t",
+        number
+    );
+
+    if (length < 0 || (size_t)length >= sizeof(buffer)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+
+    return write_all(STDOUT_FILENO, buffer, (size_t)length);
+}
+
+
 static int do_cat(
     const Options *options,
     char **operands,
     int operand_count)
 {
-    (void)options;
-    (void)operands;
-    (void)operand_count;
+    char buffer[4096];
 
-    fprintf(stderr, "myfs: cat is not implemented yet\n");
-    return 1;
+    long line_number = 0;
+    int previous_line_blank = 0;
+    int failures = 0;
+
+    int file_count = operand_count > 0 ? operand_count : 1;
+
+    for (int file_index = 0; file_index < file_count; file_index++) {
+        int fd;
+
+        if (operand_count == 0) {
+            fd = STDIN_FILENO;
+        } else {
+            fd = open(operands[file_index], O_RDONLY);
+
+            if (fd == -1) {
+                perror(operands[file_index]);
+                failures = 1;
+                continue;
+            }
+        }
+
+        int at_line_start = 1;
+        int line_has_content = 0;
+        int skip_blank_line = 0;
+
+        while (1) {
+            ssize_t bytes_read = read(fd, buffer, sizeof(buffer));
+
+            if (bytes_read == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
+
+                perror("read");
+                failures = 1;
+                break;
+            }
+
+            if (bytes_read == 0) {
+                break;
+            }
+
+            for (ssize_t i = 0; i < bytes_read; i++) {
+                char ch = buffer[i];
+
+                if (at_line_start) {
+                    skip_blank_line =
+                        options->squeeze_blank &&
+                        previous_line_blank &&
+                        ch == '\n';
+
+                    if (skip_blank_line) {
+                        continue;
+                    }
+
+                    if (options->number_all ||
+                        (options->number_nonempty && ch != '\n')) {
+
+                        if (print_line_number(++line_number) == -1) {
+                            perror("write");
+                            failures = 1;
+                            break;
+                        }
+                    }
+
+                    at_line_start = 0;
+                    line_has_content = 0;
+                }
+
+                if (ch == '\t' && options->show_tabs) {
+                    if (write_all(STDOUT_FILENO, "^I", 2) == -1) {
+                        perror("write");
+                        failures = 1;
+                        break;
+                    }
+                } else {
+                    if (ch == '\n' && options->show_ends) {
+                        if (write_all(STDOUT_FILENO, "$", 1) == -1) {
+                            perror("write");
+                            failures = 1;
+                            break;
+                        }
+                    }
+
+                    if (write_all(STDOUT_FILENO, &ch, 1) == -1) {
+                        perror("write");
+                        failures = 1;
+                        break;
+                    }
+                }
+
+                if (ch != '\n') {
+                    line_has_content = 1;
+                } else {
+                    previous_line_blank = !line_has_content;
+                    at_line_start = 1;
+                }
+            }
+
+            if (failures) {
+                break;
+            }
+        }
+
+        if (operand_count > 0 && close(fd) == -1) {
+            perror("close");
+            failures = 1;
+        }
+
+        if (failures) {
+            break;
+        }
+    }
+
+    return failures;
 }
 
 
