@@ -8,6 +8,9 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <time.h>
+#include <dirent.h>
+#include <limits.h>
+#include <stdint.h>
 
 typedef enum {
     OP_NONE,
@@ -20,6 +23,7 @@ typedef enum {
 
 typedef struct {
     Operation operation;
+    int recursive;
 
     int no_create;
 
@@ -42,7 +46,7 @@ static void usage(const char *program)
         "Usage:\n"
         "  %s -t [-C] FILE...\n"
         "  %s -a [-n] [-b] [-E] [-S] [-s] [FILE...]\n"
-        "  %s -c [-i] [-N] [-v] [-p] SOURCE DESTINATION\n"
+        "  %s -c [-r] [-i] [-N] [-v] [-p] SOURCE DESTINATION\n"
         "  %s -m [-i] [-N] [-v] SOURCE DESTINATION\n",
         program, program, program, program);
 }
@@ -123,6 +127,8 @@ static int parse_options(
                 options->verbose = 1;
             } else if (strcmp(arg, "-p") == 0) {
                 options->preserve = 1;
+            } else if (strcmp(arg, "-r") == 0) {
+                options->recursive = 1;
             }
 
             else {
@@ -170,6 +176,11 @@ static int parse_options(
     if (options->preserve &&
         options->operation != OP_COPY) {
         fprintf(stderr, "myfs: -p is valid only with -c\n");
+        goto error;
+    }
+
+    if (options->recursive && options->operation != OP_COPY) {
+        fprintf(stderr, "myfs: -r is valid only with -c\n");
         goto error;
     }
 
@@ -408,158 +419,389 @@ static int do_cat(
 }
 
 
-static int do_copy(
-    const Options *options,
-    char **operands,
-    int operand_count)
+static char *join_path(const char *directory, const char *name)
 {
-    (void)operand_count;
-
-    const char *source = operands[0];
-    const char *destination = operands[1];
-
-    struct stat source_info;
-    struct stat destination_info;
-
-    if (stat(source, &source_info) == -1) {
-        perror(source);
-        return 1;
+    size_t a = strlen(directory);
+    size_t b = strlen(name);
+    int slash = a > 0 && directory[a - 1] != '/';
+    if (a > SIZE_MAX - b - (size_t)slash - 1) {
+        errno = ENAMETOOLONG;
+        return NULL;
     }
-
-    if (!S_ISREG(source_info.st_mode)) {
-        fprintf(stderr, "myfs: source is not a regular file: %s\n",
-                source);
-        return 1;
-    }
-
-    if (stat(destination, &destination_info) == 0) {
-        if (source_info.st_dev == destination_info.st_dev &&
-            source_info.st_ino == destination_info.st_ino) {
-            fprintf(stderr,
-                    "myfs: source and destination are the same file\n");
-            return 1;
-        }
-
-        if (options->no_clobber) {
-            fprintf(stderr,
-                    "myfs: destination already exists: %s\n",
-                    destination);
-            return 1;
-        }
-
-        if (options->interactive) {
-            char answer[32];
-
-            printf("Overwrite '%s'? (y/n): ", destination);
-            fflush(stdout);
-
-            if (fgets(answer, sizeof(answer), stdin) == NULL ||
-                (answer[0] != 'y' && answer[0] != 'Y')) {
-                printf("myfs: copy cancelled\n");
-                return 0;
-            }
-        }
-    } else if (errno != ENOENT) {
-        perror(destination);
-        return 1;
-    }
-
-    int source_fd = open(source, O_RDONLY);
-
-    if (source_fd == -1) {
-        perror(source);
-        return 1;
-    }
-
-    int destination_flags = O_WRONLY | O_CREAT;
-
-    if (options->no_clobber) {
-        destination_flags |= O_EXCL;
-    } else {
-        destination_flags |= O_TRUNC;
-    }
-
-    mode_t destination_mode = options->preserve
-        ? source_info.st_mode & 07777
-        : 0666;
-
-    int destination_fd = open(
-        destination,
-        destination_flags,
-        destination_mode
-    );
-
-    if (destination_fd == -1) {
-        perror(destination);
-        close(source_fd);
-        return 1;
-    }
-
-    int failed = 0;
-    char buffer[4096];
-
-    while (1) {
-        ssize_t bytes_read = read(source_fd, buffer, sizeof(buffer));
-
-        if (bytes_read == -1) {
-            if (errno == EINTR) {
-                continue;
-            }
-
-            perror("read");
-            failed = 1;
-            break;
-        }
-
-        if (bytes_read == 0) {
-            break;
-        }
-
-        if (write_all(destination_fd, buffer, (size_t)bytes_read) == -1) {
-            perror("write");
-            failed = 1;
-            break;
-        }
-    }
-
-    if (!failed && options->preserve) {
-        if (fchmod(destination_fd, source_info.st_mode & 07777) == -1) {
-            perror("fchmod");
-            failed = 1;
-        }
-
-        struct timespec times[2];
-
-        times[0] = source_info.st_atim;
-        times[1] = source_info.st_mtim;
-
-        if (!failed && futimens(destination_fd, times) == -1) {
-            perror("futimens");
-            failed = 1;
-        }
-    }
-
-    if (close(source_fd) == -1) {
-        perror(source);
-        failed = 1;
-    }
-
-    if (close(destination_fd) == -1) {
-        perror(destination);
-        failed = 1;
-    }
-
-    if (failed) {
-        return 1;
-    }
-
-    if (options->verbose) {
-        printf("%s -> %s\n", source, destination);
-    }
-
-    return 0;
+    char *path = malloc(a + b + (size_t)slash + 1);
+    if (path == NULL)
+        return NULL;
+    memcpy(path, directory, a);
+    if (slash)
+        path[a++] = '/';
+    memcpy(path + a, name, b + 1);
+    return path;
 }
 
+static char *resolve_path(const char *path)
+{
+    char *resolved = realpath(path, NULL);
+    if (resolved != NULL || errno != ENOENT)
+        return resolved;
+    char *copy = strdup(path);
+    if (copy == NULL)
+        return NULL;
+    char *slash = strrchr(copy, '/');
+    const char *name = copy;
+    const char *parent = ".";
+    if (slash != NULL) {
+        *slash = '\0';
+        name = slash + 1;
+        parent = copy[0] == '\0' ? "/" : copy;
+    }
+    char *real_parent = realpath(parent, NULL);
+    if (real_parent == NULL && errno == ENOENT && strcmp(parent, ".") != 0)
+        real_parent = resolve_path(parent);
+    if (real_parent == NULL) {
+        free(copy);
+        return NULL;
+    }
+    resolved = join_path(real_parent, name);
+    free(real_parent);
+    free(copy);
+    return resolved;
+}
+
+static int ask_overwrite(const char *path)
+{
+    char answer[32];
+    printf("Overwrite '%s'? (y/n): ", path);
+    fflush(stdout);
+    return fgets(answer, sizeof(answer), stdin) != NULL &&
+        (answer[0] == 'y' || answer[0] == 'Y');
+}
+
+static int copy_file(const char *source, const char *destination,
+                     const Options *options)
+{
+    struct stat source_info, destination_info;
+    if (lstat(source, &source_info) == -1) {
+        perror(source);
+        return 1;
+    }
+    if (!S_ISREG(source_info.st_mode)) {
+        fprintf(stderr, "myfs: source is not a regular file: %s\n", source);
+        return 1;
+    }
+    int exists = lstat(destination, &destination_info) == 0;
+    if (!exists && errno != ENOENT) {
+        perror(destination);
+        return 1;
+    }
+    if (exists && source_info.st_dev == destination_info.st_dev &&
+        source_info.st_ino == destination_info.st_ino) {
+        fprintf(stderr, "myfs: source and destination are the same file\n");
+        return 1;
+    }
+    if (exists && options->no_clobber) {
+        if (!options->recursive) {
+            fprintf(stderr, "myfs: destination already exists: %s\n", destination);
+            return 1;
+        }
+        fprintf(stderr, "myfs: skipping existing destination: %s\n", destination);
+        return 0;
+    }
+    if (exists && options->interactive && !ask_overwrite(destination))
+        return 0;
+    if (exists && S_ISLNK(destination_info.st_mode)) {
+        if (unlink(destination) == -1) {
+            perror(destination);
+            return 1;
+        }
+        exists = 0;
+    } else if (exists && !S_ISREG(destination_info.st_mode)) {
+        fprintf(stderr, "myfs: destination is not a regular file: %s\n", destination);
+        return 1;
+    }
+    int in = open(source, O_RDONLY);
+    if (in == -1) {
+        perror(source);
+        return 1;
+    }
+    int flags = O_WRONLY | O_CREAT | (exists ? O_TRUNC : O_EXCL);
+    int out = open(destination, flags, options->preserve ? source_info.st_mode & 07777 : 0666);
+    if (out == -1) {
+        perror(destination);
+        close(in);
+        return 1;
+    }
+    int failed = 0;
+    char buffer[8192];
+    for (;;) {
+        ssize_t n = read(in, buffer, sizeof(buffer));
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0) {
+            perror(source);
+            failed = 1;
+            break;
+        }
+        if (n == 0)
+            break;
+        if (write_all(out, buffer, (size_t)n) == -1) {
+            perror(destination);
+            failed = 1;
+            break;
+        }
+    }
+    if (!failed && options->preserve) {
+        struct timespec times[2] = {source_info.st_atim, source_info.st_mtim};
+        if (fchmod(out, source_info.st_mode & 07777) == -1 || futimens(out, times) == -1) {
+            perror(destination);
+            failed = 1;
+        }
+    }
+    if (close(in) == -1) {
+        perror(source);
+        failed = 1;
+    }
+    if (close(out) == -1) {
+        perror(destination);
+        failed = 1;
+    }
+    if (!failed && options->verbose)
+        printf("%s -> %s\n", source, destination);
+    return failed;
+}
+
+static int copy_node(const char *, const char *, const Options *);
+
+static int copy_directory(const char *source, const char *destination,
+                          const Options *options, const struct stat *info)
+{
+    struct stat dst;
+    int exists = lstat(destination, &dst) == 0;
+    if (!exists && errno != ENOENT) {
+        perror(destination);
+        return 1;
+    }
+    if (exists && !S_ISDIR(dst.st_mode)) {
+        fprintf(stderr, "myfs: destination is not a directory: %s\n", destination);
+        return 1;
+    }
+    if (!exists && mkdir(destination, 0777) == -1) {
+        perror(destination);
+        return 1;
+    }
+    int failed = 0;
+    if (options->verbose && !exists)
+        printf("%s -> %s\n", source, destination);
+    DIR *dir = opendir(source);
+    if (dir == NULL) {
+        perror(source);
+        return 1;
+    }
+    struct dirent *entry;
+    for (;;) {
+        errno = 0;
+        entry = readdir(dir);
+        if (entry == NULL) {
+            if (errno != 0) {
+                perror(source);
+                failed = 1;
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        char *src = join_path(source, entry->d_name);
+        char *dstpath = join_path(destination, entry->d_name);
+        if (src == NULL || dstpath == NULL) {
+            perror("path allocation");
+            free(src);
+            free(dstpath);
+            failed = 1;
+            continue;
+        }
+        if (copy_node(src, dstpath, options) != 0)
+            failed = 1;
+        free(src);
+        free(dstpath);
+    }
+    if (closedir(dir) == -1) {
+        perror(source);
+        failed = 1;
+    }
+    if (options->preserve) {
+        struct timespec times[2] = {info->st_atim, info->st_mtim};
+        if (chmod(destination, info->st_mode & 07777) == -1 ||
+            utimensat(AT_FDCWD, destination, times, 0) == -1) {
+            perror(destination);
+            failed = 1;
+        }
+    }
+    return failed;
+}
+
+static int copy_node(const char *source, const char *destination,
+                     const Options *options)
+{
+    struct stat info;
+    if (lstat(source, &info) == -1) {
+        perror(source);
+        return 1;
+    }
+    if (S_ISREG(info.st_mode))
+        return copy_file(source, destination, options);
+    if (S_ISDIR(info.st_mode))
+        return copy_directory(source, destination, options, &info);
+    if (S_ISLNK(info.st_mode)) {
+        struct stat dst;
+        int exists = lstat(destination, &dst) == 0;
+        if (!exists && errno != ENOENT) {
+            perror(destination);
+            return 1;
+        }
+        if (exists && options->no_clobber) {
+            fprintf(stderr, "myfs: skipping existing destination: %s\n", destination);
+            return 0;
+        }
+        if (exists && options->interactive && !ask_overwrite(destination))
+            return 0;
+        size_t cap = info.st_size > 0 ? (size_t)info.st_size + 1 : 256;
+        char *target = malloc(cap);
+        if (target == NULL) {
+            perror("malloc");
+            return 1;
+        }
+        ssize_t n = readlink(source, target, cap - 1);
+        if (n < 0 || (size_t)n == cap - 1) {
+            if (n >= 0) errno = ENAMETOOLONG;
+            perror(source);
+            free(target);
+            return 1;
+        }
+        target[n] = '\0';
+        if (exists && unlink(destination) == -1) {
+            perror(destination);
+            free(target);
+            return 1;
+        }
+        int result = symlink(target, destination);
+        if (result == -1)
+            perror(destination);
+        else if (options->verbose)
+            printf("%s -> %s\n", source, destination);
+        if (result == 0 && options->preserve) {
+            struct timespec times[2] = {info.st_atim, info.st_mtim};
+            if (utimensat(AT_FDCWD, destination, times, AT_SYMLINK_NOFOLLOW) == -1)
+                perror(destination);
+        }
+        free(target);
+        return result == -1;
+    }
+    fprintf(stderr, "myfs: unsupported filesystem object: %s\n", source);
+    return 1;
+}
+
+static int do_copy(const Options *options, char **operands, int operand_count)
+{
+    (void)operand_count;
+    struct stat source_info;
+    if (lstat(operands[0], &source_info) == -1) {
+        perror(operands[0]);
+        return 1;
+    }
+    if (S_ISDIR(source_info.st_mode) && !options->recursive) {
+        fprintf(stderr, "myfs: source is a directory (use -r)\n");
+        return 1;
+    }
+    if (!S_ISDIR(source_info.st_mode))
+        return copy_node(operands[0], operands[1], options);
+    struct stat dst;
+    int exists = lstat(operands[1], &dst) == 0;
+    if (!exists && errno != ENOENT) {
+        perror(operands[1]);
+        return 1;
+    }
+    if (exists && source_info.st_dev == dst.st_dev && source_info.st_ino == dst.st_ino) {
+        fprintf(stderr, "myfs: source and destination are the same directory\n");
+        return 1;
+    }
+    if (exists && !S_ISDIR(dst.st_mode)) {
+        fprintf(stderr, "myfs: destination is not a directory: %s\n", operands[1]);
+        return 1;
+    }
+    char *src_real = realpath(operands[0], NULL);
+    char *dst_real = resolve_path(operands[1]);
+    if (src_real == NULL || dst_real == NULL) {
+        perror(src_real == NULL ? operands[0] : operands[1]);
+        free(src_real);
+        free(dst_real);
+        return 1;
+    }
+    size_t src_len = strlen(src_real);
+    if (strncmp(src_real, dst_real, src_len) == 0 &&
+        (dst_real[src_len] == '/' || dst_real[src_len] == '\0')) {
+        fprintf(stderr, "myfs: cannot copy a directory into itself\n");
+        free(src_real);
+        free(dst_real);
+        return 1;
+    }
+    free(src_real);
+    free(dst_real);
+    return copy_directory(operands[0], operands[1], options, &source_info);
+}
+
+
+static int remove_tree(const char *path)
+{
+    struct stat info;
+    if (lstat(path, &info) == -1) {
+        perror(path);
+        return 1;
+    }
+    if (!S_ISDIR(info.st_mode)) {
+        if (unlink(path) == -1) {
+            perror(path);
+            return 1;
+        }
+        return 0;
+    }
+    DIR *dir = opendir(path);
+    if (dir == NULL) {
+        perror(path);
+        return 1;
+    }
+    int failed = 0;
+    struct dirent *entry;
+    for (;;) {
+        errno = 0;
+        entry = readdir(dir);
+        if (entry == NULL) {
+            if (errno != 0) {
+                perror(path);
+                failed = 1;
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        char *child = join_path(path, entry->d_name);
+        if (child == NULL) {
+            perror("path allocation");
+            failed = 1;
+            continue;
+        }
+        if (remove_tree(child) != 0)
+            failed = 1;
+        free(child);
+    }
+    if (closedir(dir) == -1) {
+        perror(path);
+        failed = 1;
+    }
+    if (!failed && rmdir(path) == -1) {
+        perror(path);
+        failed = 1;
+    }
+    return failed;
+}
 
 static int do_move(
     const Options *options,
@@ -574,7 +816,7 @@ static int do_move(
     struct stat source_info;
     struct stat destination_info;
 
-    if (stat(source, &source_info) == -1) {
+    if (lstat(source, &source_info) == -1) {
         perror(source);
         return 1;
     }
@@ -584,6 +826,33 @@ static int do_move(
     if (!destination_exists && errno != ENOENT) {
         perror(destination);
         return 1;
+    }
+
+    if (destination_exists && source_info.st_dev == destination_info.st_dev &&
+        source_info.st_ino == destination_info.st_ino) {
+        fprintf(stderr, "myfs: source and destination are the same object\n");
+        return 1;
+    }
+
+    if (S_ISDIR(source_info.st_mode)) {
+        char *src_real = realpath(source, NULL);
+        char *dst_real = resolve_path(destination);
+        if (src_real == NULL || dst_real == NULL) {
+            perror(src_real == NULL ? source : destination);
+            free(src_real);
+            free(dst_real);
+            return 1;
+        }
+        size_t src_len = strlen(src_real);
+        if (strncmp(src_real, dst_real, src_len) == 0 &&
+            (dst_real[src_len] == '/' || dst_real[src_len] == '\0')) {
+            fprintf(stderr, "myfs: cannot move a directory into itself\n");
+            free(src_real);
+            free(dst_real);
+            return 1;
+        }
+        free(src_real);
+        free(dst_real);
     }
 
     if (destination_exists) {
@@ -627,6 +896,7 @@ static int do_move(
     copy_options.interactive = 0;
     copy_options.no_clobber = 0;
     copy_options.preserve = 1;
+    copy_options.recursive = S_ISDIR(source_info.st_mode);
 
     char *copy_operands[] = {
         (char *)source,
@@ -637,8 +907,10 @@ static int do_move(
         return 1;
     }
 
-    if (unlink(source) == -1) {
-        perror(source);
+    int remove_failed = S_ISDIR(source_info.st_mode)
+        ? remove_tree(source)
+        : (unlink(source) == -1 ? (perror(source), 1) : 0);
+    if (remove_failed) {
         return 1;
     }
 
